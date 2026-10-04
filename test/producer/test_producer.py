@@ -1,6 +1,7 @@
 import gc
 import platform
 import threading
+import time
 from unittest.mock import MagicMock
 
 import pytest
@@ -8,6 +9,7 @@ import pytest
 from kafka import KafkaProducer
 from kafka.errors import KafkaConfigurationError
 from kafka.partitioner import Partitioner, StickyPartitioner
+from kafka.protocol.metadata import MetadataResponse
 from kafka.producer.transaction_manager import TransactionManager, ProducerIdAndEpoch
 
 from test.mock_broker import MockBroker
@@ -53,6 +55,50 @@ def test_kafka_producer_context_manager_closes_on_exit():
         assert producer._closed is False
     assert producer._closed is True
     assert threading.active_count() == threads
+
+
+def test_kafka_producer_close_timeout_with_unreachable_broker():
+    """close(timeout=...) must force-close instead of escaping flush()."""
+    producer = KafkaProducer(
+        bootstrap_servers='localhost:1',
+        api_version=(4, 3),
+        enable_idempotence=False,
+        metrics_enabled=False,
+        reconnect_backoff_ms=10,
+        reconnect_backoff_max_ms=10,
+        retry_backoff_ms=50,
+        request_timeout_ms=100,
+        delivery_timeout_ms=5000,
+        socket_connection_setup_timeout_ms=50,
+        socket_connection_setup_timeout_max_ms=50,
+    )
+    try:
+        broker = MetadataResponse.MetadataResponseBroker(
+            node_id=0, host='localhost', port=1, rack=None, version=8)
+        partition = MetadataResponse.MetadataResponseTopic.MetadataResponsePartition(
+            version=8, error_code=0, partition_index=0, leader_id=0,
+            leader_epoch=0, replica_nodes=[0], isr_nodes=[0],
+            offline_replicas=[])
+        topic = MetadataResponse.MetadataResponseTopic(
+            version=8, error_code=0, name='t', is_internal=False,
+            partitions=[partition])
+        producer._metadata.update_metadata(MetadataResponse(
+            version=8, throttle_time_ms=0, brokers=[broker],
+            cluster_id='cluster-1', controller_id=0, topics=[topic]))
+
+        future = producer.send('t', b'x', partition=0)
+        started = time.monotonic()
+        producer.close(timeout=0)
+        elapsed = time.monotonic() - started
+
+        assert elapsed < 1
+        assert producer._closed
+        assert future.is_done
+        assert future.failed()
+    finally:
+        if not producer._closed:
+            producer._sender.force_close()
+            producer._client.close()
 
 
 def test_partition_calls_partitioner_partition_with_cluster():

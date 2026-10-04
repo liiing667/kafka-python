@@ -721,7 +721,11 @@ class KafkaProducer:
             raise ValueError('Invalid timeout: %s' % timeout)
 
         log.info("%s: Closing the Kafka producer with %s secs timeout.", str(self), timeout)
-        self.flush(timeout)
+        close_timer = Timer(timeout * 1000)
+        try:
+            self.flush(close_timer.timeout_secs)
+        except Errors.KafkaTimeoutError as e:
+            log.warning("%s: Timeout flushing records during close: %s", str(self), e)
         on_io_thread = self._net.on_io_thread()
         if timeout > 0:
             if on_io_thread:
@@ -732,7 +736,7 @@ class KafkaProducer:
                             str(self), timeout)
             elif self._sender is not None:
                 self._sender.initiate_close()
-                self._net.wait_for(self._sender._loop_future, timeout_ms=timeout * 1000, raise_error=False)
+                self._net.wait_for(self._sender._loop_future, timeout_ms=close_timer.timeout_ms, raise_error=False)
 
         if self._sender is not None and self._sender.is_running():
             log.info("%s: Proceeding to force close the producer since pending"
